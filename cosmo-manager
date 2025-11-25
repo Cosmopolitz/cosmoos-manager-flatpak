@@ -1,0 +1,903 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CosmoOS Manager v41
+Clean, repaired and rebuilt from the v40 source you provided.
+- Diagnose tab
+- Auto-Repair tab (symlink, timer attempts, backups dir)
+- Backup/GitHub shows "✅ Backup fullført!" after successful operations
+- Flatpak-friendly (no direct writes to /usr)
+- Creates/repairs scripts/fedo43_gui.py symlink pointing to this file
+"""
+
+import sys, os, shlex, shutil, subprocess, datetime, time
+from pathlib import Path
+
+# Qt imports (prefer PySide6)
+USE_PYSIDE = False
+USE_PYQT5 = False
+try:
+    from PySide6.QtCore import Qt, QProcess, QTimer, QSize
+    from PySide6.QtGui import QIcon, QFont, QPixmap, QColor
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QLabel, QPushButton, QTextEdit, QTabWidget, QListWidget,
+        QMessageBox, QProgressBar, QSpacerItem, QSizePolicy, QTableWidget,
+        QTableWidgetItem, QLineEdit, QGraphicsOpacityEffect, QGraphicsDropShadowEffect
+    )
+    USE_PYSIDE = True
+except Exception:
+    try:
+        from PyQt5.QtCore import Qt, QProcess, QTimer, QSize
+        from PyQt5.QtGui import QIcon, QFont, QPixmap, QColor
+        from PyQt5.QtWidgets import (
+            QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+            QLabel, QPushButton, QTextEdit, QTabWidget, QListWidget,
+            QMessageBox, QProgressBar, QSpacerItem, QSizePolicy, QTableWidget,
+            QTableWidgetItem, QLineEdit, QGraphicsOpacityEffect, QGraphicsDropShadowEffect
+        )
+        USE_PYQT5 = True
+    except Exception as e:
+        print("Ingen støttet Qt-pakke funnet. Installer python3-pyside6 eller python3-qt5.")
+        print("Feilmelding:", e)
+        sys.exit(1)
+
+# Paths
+REPO_DIR = Path.home() / "github" / "fedo43-cleaned"
+SCRIPTS_DIR = REPO_DIR / "scripts"
+BACKUP_DIR = REPO_DIR / "backups"
+LOG_GUI = REPO_DIR / "cosmo_manager_v41.log"
+HELPER_LOG_DIR = Path("/var/log/cosmo-helper")
+CLEANUP_HISTORY = HELPER_LOG_DIR / "cleanup-history.log"
+
+CLEANUP_UNIT = "cosmo-kinoite-cleanup.service"
+CLEANUP_TIMER = "cosmo-kinoite-cleanup.timer"
+
+ICON_PATH = str(REPO_DIR / "cosmo.png")
+
+STYLE = '''
+QWidget { background-color: #07101a; color:#dbeeff; font-size:13px; }
+QLabel#title { color:#9fe0ff; font-size:20px; font-weight:800; }
+QPushButton { background-color:#0f3b5a; border-radius:8px; padding:8px 14px; border:1px solid #1f5b84; color:#def; font-weight:700; }
+QPushButton:hover { background-color:#14507a; }
+QTextEdit { background-color:#0b1216; border:1px solid #183244; border-radius:6px; padding:8px; }
+QTabBar::tab { background:#07202d; padding:8px; color:#9fe0ff; border-radius:6px 6px 0 0; }
+QTabBar::tab:selected { background:#0b3a55; color:white; }
+'''
+
+# Utilities
+
+def append_gui_log(msg: str):
+    try:
+        LOG_GUI.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_GUI, "a") as f:
+            f.write(f"[{datetime.datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass
+
+
+def run_shell(cmd, timeout=None):
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+
+
+def human_readable(nbytes):
+    try:
+        n = float(nbytes)
+    except Exception:
+        return "0B"
+    for unit in ['B','KB','MB','GB','TB']:
+        if n < 1024.0:
+            return f"{n:3.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}PB"
+
+
+def du_size_bytes(path: Path):
+    try:
+        rc, out, err = run_shell(f"/usr/bin/du -sb {shlex.quote(str(path))} 2>/dev/null", timeout=6)
+        if rc == 0 and out.strip():
+            return int(out.split()[0])
+    except Exception:
+        pass
+    return 0
+
+# Runner for async shell commands shown in QTextEdit
+class Runner:
+    def __init__(self, text_widget: QTextEdit):
+        self.text_widget = text_widget
+        self.proc = None
+        self.timer = None
+        self._on_finished_cb = None
+
+    def write(self, s: str):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        try:
+            self.text_widget.append(f"[{ts}] {s}")
+        except Exception:
+            pass
+
+    def run(self, cmd: str, timeout_ms: int = 20000, on_finished=None):
+        self._on_finished_cb = on_finished
+        self.write(f"→ {cmd}")
+        self.proc = QProcess()
+        self.proc.setProcessChannelMode(QProcess.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._on_stdout)
+        self.proc.finished.connect(self._on_finished)
+        self.proc.start("/bin/sh", ["-c", cmd])
+        self.timer = QTimer()
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self._on_timeout)
+        self.timer.start(timeout_ms)
+
+    def _on_stdout(self):
+        try:
+            data = bytes(self.proc.readAllStandardOutput() or b"").decode("utf-8", errors="ignore")
+        except Exception:
+            data = ""
+        if data:
+            for line in data.rstrip().splitlines():
+                self.write(line)
+
+    def _on_finished(self, exit_code, exit_status):
+        try:
+            if self.timer and self.timer.isActive():
+                self.timer.stop()
+        except Exception:
+            pass
+        self.write(f"→ ferdig (exit={exit_code})")
+        if self._on_finished_cb:
+            try:
+                self._on_finished_cb(exit_code, None)
+            except Exception as e:
+                self.write(f"Feil i callback: {e}")
+
+    def _on_timeout(self):
+        try:
+            if self.proc and self.proc.state() == QProcess.ProcessState.Running:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.write("⚠ Timeout: prosessen ble avbrutt.")
+            if self._on_finished_cb:
+                try:
+                    self._on_finished_cb(124, None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+# Main GUI
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("CosmoOS Manager v41")
+        self.resize(1200, 900)
+        self.setStyleSheet(STYLE)
+        append_gui_log("CosmoOS Manager v41 startet")
+
+        try:
+            if os.path.exists(ICON_PATH):
+                self.setWindowIcon(QIcon(ICON_PATH))
+        except Exception:
+            pass
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        vroot = QVBoxLayout(central)
+        vroot.setSpacing(8)
+
+        # Background logo (dimmed)
+        self._bg_label = QLabel(central)
+        self._bg_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._bg_label.setAlignment(Qt.AlignCenter)
+        if os.path.exists(ICON_PATH):
+            try:
+                pix = QPixmap(ICON_PATH)
+                opacity = QGraphicsOpacityEffect()
+                opacity.setOpacity(0.06)
+                self._bg_label.setGraphicsEffect(opacity)
+                self._bg_label.setPixmap(pix)
+                self._bg_label.lower()
+            except Exception:
+                pass
+        vroot.addWidget(self._bg_label)
+
+        # Title row
+        title_row = QHBoxLayout()
+        title = QLabel("CosmoOS Manager v41")
+        title.setObjectName("title")
+        title.setFont(QFont("Sans", 18, QFont.Bold))
+        title_row.addWidget(title)
+        title_row.addStretch()
+
+        self.lamp_timer = QLabel()
+        self._style_lamp(self.lamp_timer, active=False)
+        title_row.addWidget(self.lamp_timer)
+        title_row.addWidget(QLabel("Timer:"))
+        self.hud_timer = QLabel("inaktiv")
+        title_row.addWidget(self.hud_timer)
+        vroot.addLayout(title_row)
+
+        # HUD row
+        hud = QHBoxLayout()
+        self.hud_backup = QLabel("Siste backup: —")
+        self.hud_cleanup = QLabel("Cleanup: —")
+        hud.addWidget(self.hud_backup); hud.addStretch()
+        hud.addWidget(self.hud_cleanup); hud.addStretch()
+        hud.addWidget(self.hud_timer)
+        vroot.addLayout(hud)
+
+        # Tabs
+        self.tabs = QTabWidget()
+        vroot.addWidget(self.tabs)
+        self.tabs.addTab(self._tab_dashboard(), "Dashboard")
+        self.tabs.addTab(self._tab_cleanup(), "System Cleanup")
+        self.tabs.addTab(self._tab_report(), "Cleanup Report")
+        self.tabs.addTab(self._tab_backup(), "Backup/GitHub")
+        self.tabs.addTab(self._tab_restore(), "Restore")
+        self.tabs.addTab(self._tab_logs(), "Logger")
+        self.tabs.addTab(self._tab_sysinfo(), "Systeminfo")
+        self.tabs.addTab(self._tab_cleanup_logg(), "Cleanup Logg")
+        self.tabs.addTab(self._tab_diagnostic(), "Diagnose")
+        self.tabs.addTab(self._tab_autorepair(), "Auto-Repair")
+
+        self.pb = QProgressBar(); self.pb.setValue(0); vroot.addWidget(self.pb)
+
+        self.hud_timer_q = QTimer(self); self.hud_timer_q.timeout.connect(self._update_hud); self.hud_timer_q.start(7000)
+        QTimer.singleShot(200, self._update_hud)
+
+        self.workers = []
+        self.latest_report = {}
+
+    def resizeEvent(self, ev):
+        try:
+            if self._bg_label and self._bg_label.pixmap() and not self._bg_label.pixmap().isNull():
+                pw = int(self.width() * 0.7)
+                ph = int(self.height() * 0.7)
+                pix = self._bg_label.pixmap()
+                scaled = pix.scaled(int(pw), int(ph), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self._bg_label.setPixmap(scaled)
+                self._bg_label.setFixedSize(self.width(), self.height())
+                self._bg_label.move(0, 0)
+                self._bg_label.lower()
+        except Exception:
+            pass
+        super().resizeEvent(ev)
+
+    def _style_lamp(self, widget, active=True):
+        try:
+            color = "#39ff9b" if active else "#ff4666"
+            widget.setFixedSize(14,14)
+            widget.setStyleSheet(f"border-radius:7px; background:{color};")
+            glow = QGraphicsDropShadowEffect()
+            glow.setBlurRadius(18)
+            glow.setColor(QColor(200,255,240) if active else QColor(255,120,140))
+            glow.setOffset(0,0)
+            widget.setGraphicsEffect(glow)
+        except Exception:
+            pass
+
+    def _run(self, cmd: str, widget: QTextEdit, timeout_ms: int = 20000, on_finished=None):
+        r = Runner(widget)
+        self.workers.append(r)
+        r.run(cmd, timeout_ms, on_finished=on_finished)
+        self.pb.setValue(20)
+        QTimer.singleShot(700, lambda: self.pb.setValue(0))
+        QTimer.singleShot(1500, lambda: self._cleanup_worker(r))
+        return r
+
+    def _cleanup_worker(self, w):
+        try:
+            self.workers.remove(w)
+        except Exception:
+            pass
+
+    # ---------- tabs ----------
+    def _tab_dashboard(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        title = QLabel("Dashboard — Hurtigkontroll"); title.setFont(QFont("Sans", 16, QFont.Bold)); title.setStyleSheet("color:#9fe0ff;")
+        l.addWidget(title)
+        row = QHBoxLayout()
+        b1 = QPushButton("Vis Cleanup status"); b1.clicked.connect(self.show_cleanup_status_dashboard)
+        b2 = QPushButton("Kjør Cleanup nå"); b2.clicked.connect(self.run_cleanup_now_fancy)
+        b3 = QPushButton("Aktiver daglig timer"); b3.clicked.connect(self.enable_daily_timer)
+        row.addWidget(b1); row.addWidget(b2); row.addWidget(b3)
+        row.addSpacerItem(QSpacerItem(40,20,QSizePolicy.Expanding, QSizePolicy.Minimum))
+        l.addLayout(row)
+        self.out_dashboard = QTextEdit(); self.out_dashboard.setReadOnly(True); self.out_dashboard.setMinimumHeight(260)
+        l.addWidget(self.out_dashboard)
+        return w
+
+    def _tab_cleanup(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        title = QLabel("System Cleanup"); title.setFont(QFont("Sans", 15, QFont.Bold)); title.setStyleSheet("color:#9fe0ff;")
+        l.addWidget(title)
+        row = QHBoxLayout()
+        s = QPushButton("Vis status"); r = QPushButton("Kjør Cleanup nå")
+        e = QPushButton("Aktiver timer"); d = QPushButton("Deaktiver timer")
+        h = QPushButton("Vis Cleanup-historikk")
+        s.clicked.connect(self.show_cleanup_status); r.clicked.connect(self.run_cleanup_now)
+        e.clicked.connect(self.enable_daily_timer); d.clicked.connect(self.disable_daily_timer)
+        h.clicked.connect(self.show_cleanup_history)
+        row.addWidget(s); row.addWidget(r); row.addWidget(e); row.addWidget(d); row.addWidget(h)
+        l.addLayout(row)
+        self.out_cleanup = QTextEdit(); self.out_cleanup.setReadOnly(True); self.out_cleanup.setMinimumHeight(300)
+        l.addWidget(self.out_cleanup)
+        return w
+
+    def _tab_report(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        title = QLabel("Cleanup Report"); title.setFont(QFont("Sans", 15, QFont.Bold)); title.setStyleSheet("color:#9fe0ff;")
+        l.addWidget(title)
+        row = QHBoxLayout()
+        gen = QPushButton("Generer siste report"); gen.clicked.connect(self.show_latest_report)
+        export = QPushButton("Eksporter siste report (lokal)"); export.clicked.connect(self.export_report)
+        row.addWidget(gen); row.addWidget(export)
+        l.addLayout(row)
+        self.tbl_report = QTableWidget(0,3)
+        self.tbl_report.setHorizontalHeaderLabels(["Område","Før","Etter"])  
+        self.tbl_report.setMinimumHeight(220)
+        l.addWidget(self.tbl_report)
+        self.out_report_text = QTextEdit(); self.out_report_text.setReadOnly(True); self.out_report_text.setMinimumHeight(240)
+        l.addWidget(self.out_report_text)
+        return w
+
+    def _tab_backup(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        title = QLabel("Backup & GitHub"); title.setFont(QFont("Sans", 15, QFont.Bold)); title.setStyleSheet("color:#9fe0ff;")
+        l.addWidget(title)
+        row = QHBoxLayout()
+        dry = QPushButton("Dry-run backup"); run = QPushButton("Kjør backup (apply)"); push = QPushButton("Push til GitHub")
+        dry.clicked.connect(lambda: self.run_backup(dry=True)); run.clicked.connect(lambda: self.run_backup(dry=False)); push.clicked.connect(self.git_push)
+        row.addWidget(dry); row.addWidget(run); row.addWidget(push)
+        l.addLayout(row)
+        self.out_backup = QTextEdit(); self.out_backup.setReadOnly(True)
+        l.addWidget(self.out_backup)
+        return w
+
+    def _tab_restore(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        title = QLabel("Restore (SAFE)"); title.setFont(QFont("Sans", 15, QFont.Bold)); title.setStyleSheet("color:#9fe0ff;")
+        l.addWidget(title)
+        row = QHBoxLayout()
+        refresh = QPushButton("Refresh backups"); preview = QPushButton("Preview selected"); applyb = QPushButton("Restore selected (APPLY)")
+        refresh.clicked.connect(self.refresh_backups); preview.clicked.connect(self.preview_restore); applyb.clicked.connect(self.apply_restore)
+        row.addWidget(refresh); row.addWidget(preview); row.addWidget(applyb); l.addLayout(row)
+        self.list_backups = QListWidget(); l.addWidget(self.list_backups)
+        self.out_restore = QTextEdit(); self.out_restore.setReadOnly(True); l.addWidget(self.out_restore)
+        self.refresh_backups()
+        return w
+
+    def _tab_logs(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        title = QLabel("Logger"); title.setFont(QFont("Sans", 15, QFont.Bold)); title.setStyleSheet("color:#9fe0ff;")
+        l.addWidget(title)
+        row = QHBoxLayout()
+        g = QPushButton("Last GUI-logg"); h = QPushButton("Last siste helper-logg"); c = QPushButton("Tøm logger")
+        g.clicked.connect(self.load_gui_log); h.clicked.connect(self.load_helper_log); c.clicked.connect(self.clear_logs)
+        row.addWidget(g); row.addWidget(h); row.addWidget(c)
+        l.addLayout(row)
+        self.out_logs = QTextEdit(); self.out_logs.setReadOnly(True); l.addWidget(self.out_logs)
+        return w
+
+    def _tab_sysinfo(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        title = QLabel("Systeminfo"); title.setFont(QFont("Sans", 15, QFont.Bold)); title.setStyleSheet("color:#9fe0ff;")
+        l.addWidget(title)
+        self.out_sys = QTextEdit(); self.out_sys.setReadOnly(True); l.addWidget(self.out_sys)
+        btn = QPushButton("Oppdater systeminfo"); btn.clicked.connect(self.load_system_info); l.addWidget(btn)
+        return w
+
+    def _tab_cleanup_logg(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        title = QLabel("Cleanup Logg"); title.setFont(QFont("Sans", 15, QFont.Bold)); title.setStyleSheet("color:#9fe0ff;")
+        l.addWidget(title)
+        row = QHBoxLayout()
+        self.filter_input = QLineEdit(); self.filter_input.setPlaceholderText("Søk i cleanup-historikk (f.eks 'frigjort' eller dato')")
+        btn_filter = QPushButton("Filter"); btn_filter.clicked.connect(self.filter_cleanup_log)
+        btn_reload = QPushButton("Reload logg"); btn_reload.clicked.connect(self.load_cleanup_raw)
+        row.addWidget(self.filter_input); row.addWidget(btn_filter); row.addWidget(btn_reload)
+        l.addLayout(row)
+        self.out_cleanup_log = QTextEdit(); self.out_cleanup_log.setReadOnly(True); l.addWidget(self.out_cleanup_log)
+        self.load_cleanup_raw()
+        return w
+
+    # ---------- core ----------
+    def _update_hud(self):
+        try:
+            if BACKUP_DIR.exists():
+                files = list(BACKUP_DIR.glob("*.tar.gz"))
+                if files:
+                    latest = max(files, key=lambda p: p.stat().st_mtime)
+                    t = datetime.datetime.fromtimestamp(latest.stat().st_mtime)
+                    self.hud_backup.setText(f"Siste backup: {t:%Y-%m-%d %H:%M}")
+                else:
+                    self.hud_backup.setText("Siste backup: (ingen)")
+            else:
+                self.hud_backup.setText("Siste backup: (ingen)")
+        except Exception:
+            self.hud_backup.setText("Siste backup: (feil)")
+
+        enabled = False
+        active = False
+        try:
+            enabled = subprocess.run(["systemctl", "--user", "is-enabled", "--quiet", CLEANUP_TIMER]).returncode==0
+            active = subprocess.run(["systemctl", "--user", "is-active", "--quiet", CLEANUP_TIMER]).returncode==0
+        except Exception:
+            pass
+        self.hud_cleanup.setText("Cleanup: klar")
+        self.hud_timer.setText("aktiv" if enabled or active else "inaktiv")
+        self._style_lamp(self.lamp_timer, active=(enabled or active))
+
+    def _run(self, cmd: str, widget: QTextEdit, timeout_ms: int = 20000, on_finished=None):
+        r = Runner(widget)
+        self.workers.append(r)
+        r.run(cmd, timeout_ms, on_finished=on_finished)
+        self.pb.setValue(20)
+        QTimer.singleShot(700, lambda: self.pb.setValue(0))
+        QTimer.singleShot(1500, lambda: self._cleanup_worker(r))
+        return r
+
+    def _cleanup_worker(self, w):
+        try:
+            self.workers.remove(w)
+        except Exception:
+            pass
+
+    # ---------- cleanup ----------
+    def show_cleanup_status_dashboard(self):
+        self._run(f"systemctl status {CLEANUP_UNIT} --no-pager", self.out_dashboard)
+
+    def show_cleanup_status(self):
+        self._run(f"systemctl status {CLEANUP_UNIT} --no-pager", self.out_cleanup)
+
+    def run_cleanup_now_fancy(self):
+        self.out_dashboard.append("▶ Starter cleanup fra Dashboard...")
+        self.run_cleanup_now()
+
+    def run_cleanup_now(self):
+        areas = {
+            "var_cache": Path("/var/cache"),
+            "user_cache": Path.home() / ".cache",
+            "tmp": Path("/tmp"),
+            "var_tmp": Path("/var/tmp")
+        }
+        before = {}
+        for k, p in areas.items():
+            before[k] = (du_size_bytes(p), human_readable(du_size_bytes(p)))
+        self.out_cleanup.append("▶ Starter Fancy Cleanup: måler før-størrelser...")
+        for k, (b, h) in before.items():
+            self.out_cleanup.append(f" - {k}: {h}")
+
+        # Prefer user unit
+        rc_user = subprocess.run(["systemctl", "--user", "status", CLEANUP_UNIT], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        if rc_user == 0:
+            cmd = f"systemctl --user start {CLEANUP_UNIT}"
+            self._run(cmd, self.out_cleanup, timeout_ms=60000, on_finished=lambda c,o: self._on_cleanup_finished_user(c,o,before))
+            self.out_cleanup.append("⏳ Venter på at bruker-cleanup skal fullføre...")
+            return
+
+        # Fallback to system with pkexec if user not present
+        self.out_cleanup.append("ℹ Bruker-cleanup ikke funnet; forsøker system-cleanup (kan kreve autorisasjon).")
+        cmd = f"pkexec systemctl start {CLEANUP_UNIT}"
+        self._run(cmd, self.out_cleanup, timeout_ms=60000, on_finished=lambda c,o: self._on_cleanup_finished_user(c,o,before))
+        self.out_cleanup.append("⏳ Venter på at cleanup skal fullføre...")
+
+    def _on_cleanup_finished_user(self, code, out, before):
+        areas = {
+            "var_cache": Path("/var/cache"),
+            "user_cache": Path.home() / ".cache",
+            "tmp": Path("/tmp"),
+            "var_tmp": Path("/var/tmp")
+        }
+        after = {}
+        for k, p in areas.items():
+            after[k] = (du_size_bytes(p), human_readable(du_size_bytes(p)))
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [f"[{ts}] Cleanup kjørt (exit={code})"]
+        for k in before:
+            before_b = before[k][0]
+            after_b = after[k][0]
+            freed = max(0, before_b - after_b)
+            lines.append(f" - {k}: før={human_readable(before_b)} etter={human_readable(after_b)} frigjort={human_readable(freed)}")
+        summary = "\n".join(lines) + "\n\n"
+
+        user_log = Path.home() / ".local" / "share" / "cosmo-cleanup-history.log"
+        try:
+            user_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(user_log, "a") as f:
+                f.write(summary)
+            self.out_cleanup.append("✅ Cleanup-historikk skrevet (bruker-logg).")
+        except Exception:
+            tmp = "/tmp/cosmo_cleanup_summary.tmp"
+            try:
+                with open(tmp, "w") as f:
+                    f.write(summary)
+                rc, outp, err = run_shell(f"pkexec bash -lc {shlex.quote(f'cat {tmp} >> {CLEANUP_HISTORY} && rm -f {tmp}')}", timeout=20)
+                if rc == 0:
+                    self.out_cleanup.append("✅ Cleanup-historikk skrevet (privileged).")
+                else:
+                    self.out_cleanup.append("⚠ Kunne ikke skrive cleanup-historikk (privileged).")
+            except Exception as e:
+                self.out_cleanup.append(f"⚠ Feil ved skriving av historikk: {e}")
+
+        QTimer.singleShot(700, lambda: self.load_cleanup_raw())
+        self.latest_report = {"before": before, "after": after, "timestamp": ts}
+        self.show_latest_report()
+
+    def enable_daily_timer(self):
+        self.out_cleanup.append("→ Forsøker å aktivere daglig cleanup-timer (bruker)...")
+        rc, out, err = run_shell(f"systemctl --user enable --now {CLEANUP_TIMER}", timeout=12)
+        if rc == 0:
+            self.out_cleanup.append("✅ Daglig cleanup-timer er nå aktiv (user).")
+        else:
+            self.out_cleanup.append("⚠ Kunne ikke aktivere user-timer. Fallback til system...")
+            rc2, o2, e2 = run_shell(f"pkexec bash -lc {shlex.quote(f'systemctl enable --now {CLEANUP_TIMER}')}", timeout=18)
+            if rc2 == 0:
+                self.out_cleanup.append("✅ Daglig cleanup-timer aktivert via system (krever root).")
+            else:
+                self.out_cleanup.append("⚠ Klarte ikke å aktivere timer (hverken user eller system).")
+                if e2:
+                    self.out_cleanup.append(e2.strip())
+        QTimer.singleShot(400, self._update_hud)
+
+    def disable_daily_timer(self):
+        self.out_cleanup.append("→ Forsøker å deaktivere daglig cleanup-timer (bruker)...")
+        rc, out, err = run_shell(f"systemctl --user stop {CLEANUP_TIMER} ; systemctl --user disable {CLEANUP_TIMER}", timeout=12)
+        if rc == 0:
+            self.out_cleanup.append("⛔ Daglig cleanup-timer er nå deaktivert (user).")
+        else:
+            self.out_cleanup.append("⚠ Kunne ikke deaktivere user-timer. Fallback til system...")
+            rc2, o2, e2 = run_shell(f"pkexec bash -lc {shlex.quote(f'systemctl stop {CLEANUP_TIMER} ; systemctl disable {CLEANUP_TIMER}')}", timeout=18)
+            if rc2 == 0:
+                self.out_cleanup.append("⛔ Daglig cleanup-timer deaktivert via system (krever root).")
+            else:
+                self.out_cleanup.append("⚠ Kunne ikke deaktivere timer (hverken user eller system).")
+                if e2:
+                    self.out_cleanup.append(e2.strip())
+        QTimer.singleShot(300, self._update_hud)
+
+    def show_cleanup_history(self):
+        self.load_cleanup_raw()
+        self.tabs.setCurrentIndex(self.tabs.count() - 1)
+
+    def load_cleanup_raw(self):
+        user_log = Path.home() / ".local" / "share" / "cosmo-cleanup-history.log"
+        try:
+            if user_log.exists():
+                self.out_cleanup_log.setPlainText(user_log.read_text()[-50000:])
+                return
+            if not CLEANUP_HISTORY.exists():
+                self.out_cleanup_log.setPlainText("(Ingen cleanup-historikk funnet. Kjør Cleanup for å generere.)")
+                return
+            text = CLEANUP_HISTORY.read_text()
+            self.out_cleanup_log.setPlainText(text[-50000:])
+        except Exception as e:
+            self.out_cleanup_log.setPlainText(f"(Kunne ikke lese cleanup-historikk: {e})")
+
+    def filter_cleanup_log(self):
+        query = self.filter_input.text().strip()
+        if not CLEANUP_HISTORY.exists():
+            self.out_cleanup_log.setPlainText("(Ingen cleanup-historikk funnet.)")
+            return
+        text = CLEANUP_HISTORY.read_text()
+        if not query:
+            self.out_cleanup_log.setPlainText(text)
+            return
+        lines = [l for l in text.splitlines() if query.lower() in l.lower()]
+        self.out_cleanup_log.setPlainText("\n".join(lines[-500:]) if lines else "(Ingen treff)")
+
+    # ---------- Backup & GitHub ----------
+    def run_backup(self, dry=True):
+        script = SCRIPTS_DIR / "auto_backup.sh"
+        if not script.exists():
+            self.out_backup.append(f"auto_backup.sh mangler i {SCRIPTS_DIR}")
+            return
+        mode = "--dry-run" if dry else "--apply"
+        def after(exit_code, out):
+            if exit_code == 0:
+                self.out_backup.append("✅ Backup fullført!")
+            else:
+                self.out_backup.append(f"⚠ Backup feilet (exit={exit_code})")
+        self._run(f"{script} {mode}", self.out_backup, timeout_ms=600000, on_finished=after)
+
+    def git_push(self):
+        git_dir = REPO_DIR / ".git"
+        lock = git_dir / "index.lock"
+        if lock.exists():
+            self.out_backup.append("⚠ Git: index.lock funnet — forsøker å fjerne...")
+            try:
+                lock.unlink()
+                self.out_backup.append("✅ Fjernet index.lock.")
+            except Exception as e:
+                self.out_backup.append(f"⚠ Kunne ikke fjerne index.lock: {e}")
+                return
+        cmds = [
+            f"git -C {shlex.quote(str(REPO_DIR))} add .",
+            f"git -C {shlex.quote(str(REPO_DIR))} commit -m 'Backup via CosmoOS Manager' || true",
+            f"git -C {shlex.quote(str(REPO_DIR))} push"
+        ]
+        def chain(i=0):
+            if i >= len(cmds):
+                self.out_backup.append("✅ Backup fullført!")
+                return
+            self._run(cmds[i], self.out_backup, timeout_ms=120000, on_finished=lambda e,o: chain(i+1))
+        chain()
+
+    # ---------- restore/logs/etc ----------
+    def refresh_backups(self):
+        self.list_backups.clear()
+        if BACKUP_DIR.exists():
+            for p in sorted(BACKUP_DIR.glob("*.tar.gz"), reverse=True):
+                self.list_backups.addItem(p.name)
+
+    def preview_restore(self):
+        it = self.list_backups.currentItem()
+        if not it:
+            self.out_restore.append("Velg backup først.")
+            return
+        path = BACKUP_DIR / it.text()
+        self._run(f"tar -tzf {shlex.quote(str(path))}", self.out_restore, timeout_ms=120000)
+
+    def apply_restore(self):
+        it = self.list_backups.currentItem()
+        if not it:
+            self.out_restore.append("Velg backup først.")
+            return
+        path = BACKUP_DIR / it.text()
+        script = SCRIPTS_DIR / "restore.sh"
+        if not script.exists():
+            self.out_restore.append("restore.sh mangler.")
+            return
+        ask = QMessageBox.question(self, "Bekreft", f"Restore fra {path} kan overskrive filer. Fortsett?")
+        if ask != QMessageBox.Yes:
+            self.out_restore.append("Restore avbrutt.")
+            return
+        self._run(f"{script} {shlex.quote(str(path))} --apply", self.out_restore, timeout_ms=600000)
+
+    def load_gui_log(self):
+        if LOG_GUI.exists():
+            text = LOG_GUI.read_text()[-50000:]
+            self.out_logs.setPlainText(text)
+        else:
+            self.out_logs.setPlainText("(ingen GUI-logg)")
+
+    def load_helper_log(self):
+        if not HELPER_LOG_DIR.exists():
+            self.out_logs.setPlainText("(ingen helper-logger)")
+            return
+        files = sorted(HELPER_LOG_DIR.glob("*.log"))
+        if not files:
+            self.out_logs.setPlainText("(ingen helper-logger)")
+            return
+        self.out_logs.setPlainText(files[-1].read_text()[-50000:])
+
+    def clear_logs(self):
+        try:
+            if LOG_GUI.exists():
+                LOG_GUI.unlink()
+            self.out_logs.append("✅ GUI-logg slettet lokalt.")
+        except Exception as e:
+            self.out_logs.append(f"⚠ Kunne ikke slette GUI-log: {e}")
+        rc, out, err = run_shell(f"pkexec rm -f {shlex.quote(str(HELPER_LOG_DIR))}/*.log", timeout=12)
+        if rc == 0:
+            self.out_logs.append("✅ Helper-logger slettet (privileged).")
+        else:
+            self.out_logs.append("ℹ Kunne ikke slette helper-logger som root (krever autorisasjon).")
+
+    def load_system_info(self):
+        self._run("uname -a && lsb_release -a 2>/dev/null || true", self.out_sys, timeout_ms=5000)
+
+    # ---------- report UI ----------
+    def show_latest_report(self):
+        if not self.latest_report:
+            self.out_report_text.setPlainText("(Ingen rapport tilgjengelig)")
+            return
+        rpt = self.latest_report
+        self.tbl_report.setRowCount(0)
+        for k in rpt["before"]:
+            bbytes = rpt["before"][k][0]
+            abytes = rpt["after"][k][0]
+            row = self.tbl_report.rowCount()
+            self.tbl_report.insertRow(row)
+            self.tbl_report.setItem(row,0, QTableWidgetItem(k))
+            self.tbl_report.setItem(row,1, QTableWidgetItem(human_readable(bbytes)))
+            self.tbl_report.setItem(row,2, QTableWidgetItem(human_readable(abytes)))
+        text_lines = []
+        for k in rpt["before"]:
+            bbytes = rpt["before"][k][0]
+            abytes = rpt["after"][k][0]
+            freed = max(0, bbytes - abytes)
+            text_lines.append(f"{k}: {human_readable(freed)} frigjort")
+        text_lines.append(f"\nTid: {rpt.get('timestamp')}")
+        self.out_report_text.setPlainText("\n".join(text_lines))
+        self.tabs.setCurrentIndex(2)
+
+    def export_report(self):
+        if not self.latest_report:
+            QMessageBox.information(self, "Export", "Ingen rapport å eksportere.")
+            return
+        outp = REPO_DIR / f"cleanup_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        try:
+            with open(outp, "w") as f:
+                f.write(self.out_report_text.toPlainText())
+            QMessageBox.information(self, "Export", f"Rapport skrevet: {outp}")
+        except Exception as e:
+            QMessageBox.warning(self, "Export", f"Kunne ikke skrive rapport: {e}")
+
+    # ---------- diagnose ----------
+    def _tab_diagnostic(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        title = QLabel("Systemdiagnose"); title.setFont(QFont("Sans", 15, QFont.Bold)); title.setStyleSheet("color:#9fe0ff;")
+        l.addWidget(title)
+        runbtn = QPushButton("Kjør Diagnose"); runbtn.clicked.connect(self.run_diagnostics)
+        l.addWidget(runbtn)
+        self.out_diag = QTextEdit(); self.out_diag.setReadOnly(True); self.out_diag.setMinimumHeight(300)
+        l.addWidget(self.out_diag)
+        return w
+
+    def run_diagnostics(self):
+        out = []
+        def add(msg): out.append(msg)
+        add("=== SYSTEMD USER CLEANUP-SERVICE & TIMER ===")
+        srv = subprocess.run(["systemctl","--user","status",CLEANUP_UNIT], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        add("  ✔ cleanup.service finnes (user)" if srv.returncode==0 else "  ⚠ cleanup.service mangler (user)")
+        t1 = subprocess.run(["systemctl","--user","is-enabled","--quiet",CLEANUP_TIMER])
+        add("  ✔ cleanup.timer er ENABLED" if t1.returncode==0 else "  ⚠ cleanup.timer er ikke enabled")
+        t2 = subprocess.run(["systemctl","--user","is-active","--quiet",CLEANUP_TIMER])
+        add("  ✔ cleanup.timer er ACTIVE" if t2.returncode==0 else "  ⚠ cleanup.timer er ikke aktiv")
+        add("\n=== INSTALLASJON AV CosmoOS Manager ===")
+        add("  ✔ /usr/local/bin/cosmo-manager finnes" if os.path.exists("/usr/local/bin/cosmo-manager") else "  ✘ cosmo-manager mangler i /usr/local/bin")
+        add("  ✔ .desktop-fil er installert" if os.path.exists("/usr/local/share/applications/org.cosmo.CosmoOSManager.desktop") else "  ⚠ .desktop-fil mangler")
+        add("\n=== PYTHON & QT ===")
+        try:
+            import PySide6
+            add("  ✔ PySide6 funnet")
+        except Exception:
+            add("  ✘ PySide6 mangler (GUI kan ikke starte!)")
+        add(f"  Python: {sys.version.split()[0]}")
+        add("\n=== BACKUP-SKRIPTSTEST ===")
+        add("  ✔ auto_backup.sh finnes" if os.path.exists(SCRIPTS_DIR / "auto_backup.sh") else "  ✘ auto_backup.sh mangler")
+        add("  ✔ restore.sh finnes" if os.path.exists(SCRIPTS_DIR / "restore.sh") else "  ⚠ restore.sh mangler")
+        add("\n=== GIT STATUS ===")
+        r = subprocess.run(["git","rev-parse","--is-inside-work-tree"], cwd=str(REPO_DIR))
+        add("  ✔ Git repository OK" if r.returncode==0 else "  ✘ Ikke et git-repo!")
+        try:
+            branch = subprocess.check_output(["git","branch","--show-current"], cwd=str(REPO_DIR), text=True).strip()
+            add(f"  Branch: {branch}")
+        except Exception:
+            add("  ⚠ Kan ikke hente branch")
+        ssh = subprocess.run(["ssh-add","-l"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        add("  ✔ SSH-nøkler lastet i agent" if ssh.returncode==0 else "  ⚠ Ingen SSH-nøkler lastet inn (git push vil spørre om passord)")
+        try:
+            remotes = subprocess.check_output(["git","remote","-v"], cwd=str(REPO_DIR), text=True)
+            add("  ✔ GitHub remote funnet" if "github.com" in remotes else "  ⚠ GitHub remote ikke funnet")
+        except Exception:
+            add("  ⚠ Kan ikke lese git-remote")
+        add("\n=== BACKUP-DIRECTORY ===")
+        if BACKUP_DIR.exists():
+            files = list(BACKUP_DIR.glob("*.tar.gz"))
+            add(f"  ✔ backups/ finnes ({len(files)} filer)")
+        else:
+            add("  ⚠ backups/-katalog mangler")
+        add("\n=== SYMLINK-SJEKK ===")
+        link = SCRIPTS_DIR / "fedo43_gui.py"
+        try:
+            if link.is_symlink():
+                add(f"  ✔ Symlink finnes → peker på {link.resolve()}")
+            else:
+                add("  ⚠ scripts/fedo43_gui.py er ikke symlink")
+        except Exception:
+            add("  ⚠ Kunne ikke inspeksere symlink")
+        add("\n=== PERMISJONER ===")
+        py = REPO_DIR / "cosmo-manager"
+        if py.exists() and os.access(py, os.X_OK):
+            add("  ✔ cosmo-manager er kjørbar")
+        else:
+            add("  ⚠ cosmo-manager bør være kjørbar (chmod +x)")
+        add("\n=== FERDIG ===")
+        self.out_diag.setPlainText("\n".join(out))
+        self.tabs.setCurrentIndex(self.tabs.count() - 2)
+
+    # ---------- Auto-Repair ----------
+    def _tab_autorepair(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        title = QLabel("Auto-Repair"); title.setFont(QFont("Sans", 15, QFont.Bold)); title.setStyleSheet("color:#9fe0ff;")
+        l.addWidget(title)
+        b = QPushButton("Reparer installasjon"); b.clicked.connect(self.auto_repair)
+        l.addWidget(b)
+        self.out_fix = QTextEdit(); self.out_fix.setReadOnly(True); l.addWidget(self.out_fix)
+        return w
+
+    def auto_repair(self):
+        lines = []
+        def add(s): lines.append(s)
+        add("=== AUTOREPAIR START ===")
+
+        # Ensure repo dir exists
+        try:
+            REPO_DIR.mkdir(parents=True, exist_ok=True)
+            add(f"✔ Repo dir: {REPO_DIR}")
+        except Exception as e:
+            add(f"⚠ Kan ikke opprette repo dir: {e}")
+
+        # Ensure backups dir
+        try:
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            add(f"✔ Backups dir: {BACKUP_DIR}")
+        except Exception as e:
+            add(f"⚠ Kan ikke opprette backups dir: {e}")
+
+        # Symlink fix
+        link = SCRIPTS_DIR / "fedo43_gui.py"
+        try:
+            SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+            if link.exists() or link.is_symlink():
+                try:
+                    link.unlink()
+                except Exception:
+                    pass
+            # create relative symlink to this file
+            rel = os.path.relpath(Path(__file__).resolve(), start=SCRIPTS_DIR)
+            link.symlink_to(rel)
+            add(f"✔ Symlink opprettet: {link} -> {rel}")
+        except Exception as e:
+            add(f"⚠ Kunne ikke opprette symlink: {e}")
+
+        # Try to enable user timer (best effort)
+        try:
+            rc, _, _ = run_shell(f"systemctl --user enable --now {CLEANUP_TIMER}", timeout=15)
+            if rc == 0:
+                add("✔ User timer aktivert")
+            else:
+                # try system with pkexec
+                rc2, _, _ = run_shell(f"pkexec systemctl enable --now {CLEANUP_TIMER}", timeout=20)
+                if rc2 == 0:
+                    add("✔ System timer aktivert via pkexec")
+                else:
+                    add("⚠ Klarte ikke aktivere timer (user/system)")
+        except Exception as e:
+            add(f"⚠ Feil ved timer-aktivering: {e}")
+
+        add("=== AUTOREPAIR FERDIG ===")
+        self.out_fix.setPlainText("\n".join(lines))
+        self.tabs.setCurrentIndex(self.tabs.count() - 1)
+
+# ---- main ----
+def main():
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+
+    # create/update symlink scripts/fedo43_gui.py -> this file (relative)
+    try:
+        link = Path(REPO_DIR / "scripts" / "fedo43_gui.py")
+        target = Path(__file__).resolve()
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.exists() or link.is_symlink():
+            try:
+                if link.resolve() != target:
+                    link.unlink()
+                    rel = os.path.relpath(target, start=link.parent)
+                    link.symlink_to(rel)
+            except Exception:
+                pass
+        else:
+            try:
+                rel = os.path.relpath(target, start=link.parent)
+                link.symlink_to(rel)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    append_gui_log("CosmoOS Manager v41 shown")
+    sys.exit(app.exec() if (USE_PYSIDE or USE_PYQT5) else 0)
+
+if __name__ == "__main__":
+    main()

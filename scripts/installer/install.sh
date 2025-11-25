@@ -15,5 +15,5 @@ flatpak-builder --force-clean build-dir org.cosmo.CosmoOSManager.json
 flatpak-builder --user --install --force-clean build-dir org.cosmo.CosmoOSManager.json
 
 echo "🎉 Installert!"
-echo "Kjør:"
-echo "  flatpak run org.cosmo.CosmoOSManager"
+echo "Start programmet:"
+echo "    flatpak run org.cosmo.CosmoOSManager"
