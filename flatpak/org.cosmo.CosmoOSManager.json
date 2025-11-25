@@ -1,0 +1,32 @@
+{
+  "app-id": "org.cosmo.CosmoOSManager",
+  "runtime": "org.kde.Platform",
+  "runtime-version": "6.6",
+  "sdk": "org.kde.Sdk",
+  "command": "cosmo-manager",
+  "finish-args": [
+    "--share=network",
+    "--share=ipc",
+    "--socket=x11",
+    "--socket=wayland",
+    "--device=dri",
+    "--filesystem=home",
+    "--talk-name=org.freedesktop.Flatpak"
+  ],
+  "modules": [
+    {
+      "name": "cosmo-manager",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -D cosmo-manager /app/bin/cosmo-manager",
+        "install -D cosmo.png /app/share/icons/hicolor/256x256/apps/org.cosmo.CosmoOSManager.png",
+        "install -D org.cosmo.CosmoOSManager.desktop /app/share/applications/org.cosmo.CosmoOSManager.desktop"
+      ],
+      "sources": [
+        { "type": "file", "path": "cosmo-manager" },
+        { "type": "file", "path": "cosmo.png" },
+        { "type": "file", "path": "org.cosmo.CosmoOSManager.desktop" }
+      ]
+    }
+  ]
+}

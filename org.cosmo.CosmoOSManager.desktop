@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=CosmoOS Manager
+Comment=Backup, Cleanup og Systemverktøy
+Exec=cosmo-manager
+Terminal=false
+Type=Application
+Icon=org.cosmo.CosmoOSManager
+Categories=Utility;System;
